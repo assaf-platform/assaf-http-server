@@ -5,16 +5,12 @@ High Performance Frontend
 
 ### Build docker image and push it
 ```bash
-./build.sh
+make build
 ```
 
 ### Test
 ```bash
-go test
+make test
 ```
 
-### Benchmark
-```bash
-go test -v -bench=.
-```
 

@@ -351,7 +351,7 @@ func requestHandler(consumeRequests chan ConsumeRequest, msgQueue chan<- message
 			return
 		}
 
-		routing := strings.Replace(cq.routing, "-", "", 1)
+		routing := strings.Replace(cq.routing, "-", "", -1)
 		request := DataRequest{cleanPath, requestId, cq.values}
 		subscribe := make(chan message)
 		defer close(subscribe)

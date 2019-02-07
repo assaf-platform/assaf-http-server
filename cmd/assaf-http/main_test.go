@@ -47,10 +47,9 @@ func testParseURI(t assert.TestingT) {
 	p_new_style := "Php+Developer"
 	p_old_style := "Php%20Developer"
 
-
 	lang := "nl"
 
-	q := httptest.NewRequest("GET", fmt.Sprintf("http://example.com/google-keywords/%s?job_category=Sales&location=%s&location_id=2528&language_id=1010",p_new_style, lang), nil)
+	q := httptest.NewRequest("GET", fmt.Sprintf("http://example.com/google-keywords/%s?job_category=Sales&location=%s&location_id=2528&language_id=1010", p_new_style, lang), nil)
 
 	fmt.Printf("q request uri: %v", q.RequestURI)
 
