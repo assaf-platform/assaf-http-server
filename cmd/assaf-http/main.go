@@ -280,7 +280,7 @@ func subscribe(queueName string, sessions chan chan session, consumeRequests cha
 					sub.Ack(msg.DeliveryTag, false)
 					break
 				}
-					// Return message to queue if it's not stale yet
+				// Return message to queue if it's not stale yet
 				if isMsgFresh(consumeRequest) {
 					consumeRequests <- consumeRequest
 				} else {
@@ -313,7 +313,7 @@ func buildQuery(u *url.URL) (CleanQuery, error) {
 	if len(cleanQuery) < 3 {
 		return blank, url.EscapeError("bad request, not enough arguments")
 	}
-	return CleanQuery{routing: cleanQuery[1], p: cleanQuery[2], values:p.Query()}, nil
+	return CleanQuery{routing: cleanQuery[1], p: cleanQuery[2], values: p.Query()}, nil
 }
 func cleanRequest(p string) (string, error) {
 
