@@ -8,7 +8,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/streadway/amqp"
+	jaeger "github.com/uber/jaeger-client-go"
+	config "github.com/uber/jaeger-client-go/config"
+	"io"
 	"log"
 	"math"
 	"math/rand"
@@ -29,11 +33,40 @@ var (
 	//_reliable     = flag.Bool("reliable", true, "Wait for the publisher confirmation before exiting")
 )
 
-func Logger(inner http.Handler, name string) http.Handler {
+// initJaeger returns an instance of Jaeger Tracer that samples 100% of traces and logs all spans to stdout.
+func initJaeger(service string) (opentracing.Tracer, io.Closer) {
+	cfg := &config.Configuration{
+		Sampler: &config.SamplerConfig{
+			Type:  "const",
+			Param: 1,
+		},
+		Reporter: &config.ReporterConfig{
+			LogSpans: true,
+		},
+		ServiceName: service,
+	}
+
+	log.Print("#######################")
+	log.Print(cfg.Sampler.SamplingServerURL)
+
+	tracer, closer, err := cfg.NewTracer(config.Logger(jaeger.StdLogger))
+	if err != nil {
+		panic(fmt.Sprintf("ERROR: cannot init Jaeger: %v\n", err))
+	}
+	return tracer, closer
+}
+
+func Logger(inner http.Handler, name string, tracer opentracing.Tracer) http.Handler {
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		span := tracer.StartSpan("call-http")
+
 		start := time.Now()
 
 		inner.ServeHTTP(w, r)
+
+		span.Finish()
 
 		log.Printf(
 			"%s\t%s\t%s\t%s",
@@ -80,7 +113,6 @@ func declareExchange(channel *amqp.Channel, exchangeName string, exchangeType st
 	if err := channel.ExchangeDeclare(
 		exchangeName, // name
 		exchangeType, // type
-		//TODO: recieve as params
 		isDurable,    // durable
 		isAutoDelete, // auto-deleted
 		false,        // internal
@@ -96,11 +128,15 @@ func declareExchange(channel *amqp.Channel, exchangeName string, exchangeType st
 // publish publishes messages to a reconnecting session to a fanout exchange.
 // It receives from the application specific source of messages.
 
-func publishToQueue(sessions chan chan session, msgs <-chan message) error {
+func publishToQueue(sessions chan chan session, msgs <-chan message, ctx context.Context) error {
 
 	// This function dials, connects, declares, publishes, and tears down,
 	// all in one go. In a real service, you probably want to maintain a
 	// long-lived connection as state, and publish against that.
+
+	span, _ := opentracing.StartSpanFromContext(ctx, "publish-to-queue")
+	defer span.Finish()
+
 	for session := range sessions {
 		sub := <-session
 		select {
@@ -200,7 +236,7 @@ func redial(ctx context.Context, url string, exchangeName string, exchangeType s
 
 			partialSession, err := RabbitConnect(url)
 			if err != nil {
-				log.Fatalf("couldn't create connenction %v", partialSession)
+				log.Fatalf("couldn't create connection %v", partialSession)
 			}
 			err = declareExchange(partialSession.Channel, exchangeName, exchangeType, isDurable, isAutoDelete)
 			if err != nil {
@@ -209,7 +245,7 @@ func redial(ctx context.Context, url string, exchangeName string, exchangeType s
 			log.Printf("session created in redial %v", partialSession)
 			currSession := session{partialSession.Connection, partialSession.Channel, exchangeName, exchangeType}
 			if err != nil {
-				fmt.Errorf("Channel could not be put into confirm mode: %s", err)
+				log.Fatalf("Channel could not be put into confirm mode: %s", err)
 			}
 
 			select {
@@ -234,7 +270,10 @@ func isMsgFresh(cm ConsumeRequest) bool {
 // identity returns the same host/process unique string for the lifetime of
 // this process so that subscriber reconnections reuse the same queue name.
 
-func subscribe(queueName string, sessions chan chan session, consumeRequests chan ConsumeRequest, messages chan<- message) {
+func subscribe(queueName string, sessions chan chan session, consumeRequests chan ConsumeRequest, messages chan<- message, ctx context.Context) {
+
+	span, _ := opentracing.StartSpanFromContext(ctx, "subscribe")
+	defer span.Finish()
 
 	log.Printf("subscribed to %s", queueName)
 	for session := range sessions {
@@ -280,7 +319,7 @@ func subscribe(queueName string, sessions chan chan session, consumeRequests cha
 					sub.Ack(msg.DeliveryTag, false)
 					break
 				}
-					// Return message to queue if it's not stale yet
+				// Return message to queue if it's not stale yet
 				if isMsgFresh(consumeRequest) {
 					consumeRequests <- consumeRequest
 				} else {
@@ -296,6 +335,7 @@ func subscribe(queueName string, sessions chan chan session, consumeRequests cha
 
 			}
 		}
+
 	}
 }
 
@@ -313,7 +353,7 @@ func buildQuery(u *url.URL) (CleanQuery, error) {
 	if len(cleanQuery) < 3 {
 		return blank, url.EscapeError("bad request, not enough arguments")
 	}
-	return CleanQuery{routing: cleanQuery[1], p: cleanQuery[2], values:p.Query()}, nil
+	return CleanQuery{routing: cleanQuery[1], p: cleanQuery[2], values: p.Query()}, nil
 }
 func cleanRequest(p string) (string, error) {
 
@@ -351,7 +391,7 @@ func requestHandler(consumeRequests chan ConsumeRequest, msgQueue chan<- message
 			return
 		}
 
-		routing := strings.Replace(cq.routing, "-", "", -1)
+		routing := strings.Replace(cq.routing, "-", "", 1)
 		request := DataRequest{cleanPath, requestId, cq.values}
 		subscribe := make(chan message)
 		defer close(subscribe)
@@ -406,6 +446,9 @@ func (rc RabbitMQConf) String() string {
 
 func main() {
 
+	tracer, closer := initJaeger("assaf-frontend")
+	defer closer.Close()
+
 	url := fmt.Sprint(getRabbitConf())
 
 	ctx, done := context.WithCancel(context.Background())
@@ -417,17 +460,17 @@ func main() {
 	consumeRequests := make(chan ConsumeRequest, 100)
 
 	go func() {
-		publishToQueue(msgSessions, toQueue)
+		publishToQueue(msgSessions, toQueue, ctx)
 		//done()
 	}()
 
 	go func() {
-		subscribe("response_pubsub", pubsubSessions, consumeRequests, fromPubSub)
+		subscribe("response_pubsub", pubsubSessions, consumeRequests, fromPubSub, ctx)
 		//done()
 	}()
 	defer done()
 
-	routerHttpHandler := Logger(requestHandler(consumeRequests, toQueue), "ds-proxy")
+	routerHttpHandler := Logger(requestHandler(consumeRequests, toQueue), "ds-proxy", tracer)
 	log.Fatal(http.ListenAndServe(":8080", routerHttpHandler))
 
 	<-ctx.Done()
