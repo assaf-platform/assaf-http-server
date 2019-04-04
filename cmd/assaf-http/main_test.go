@@ -37,10 +37,11 @@ func testRabbitConf(t assert.TestingT) {
 
 func testTimeDecay(t assert.TestingT) {
 	when := time.Now()
-	fresh := isMsgFresh(ConsumeRequest{1, make(chan message), when.Add(181 * time.Second)})
-	assert.Equal(t, false, fresh)
-	fresh = isMsgFresh(ConsumeRequest{1, make(chan message), when})
+	//t.Errorf("Hello!")
+	fresh := msgIsFresh(ConsumeRequest{1, make(chan message), when.Add(-10 * time.Second)})
 	assert.Equal(t, true, fresh)
+	fresh = msgIsFresh(ConsumeRequest{1, make(chan message), when})
+	assert.Equal(t, false, fresh)
 
 }
 func testParseURI(t assert.TestingT) {

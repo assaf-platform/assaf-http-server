@@ -57,17 +57,13 @@ func initJaeger(service string) (opentracing.Tracer, io.Closer) {
 	return tracer, closer
 }
 
-func Logger(inner http.Handler, name string, tracer opentracing.Tracer) http.Handler {
+func Logger(inner http.Handler, name string) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-		span := tracer.StartSpan("call-http")
 
 		start := time.Now()
 
 		inner.ServeHTTP(w, r)
-
-		span.Finish()
 
 		log.Printf(
 			"%s\t%s\t%s\t%s",
@@ -129,49 +125,47 @@ func declareExchange(channel *amqp.Channel, exchangeName string, exchangeType st
 // publish publishes messages to a reconnecting session to a fanout exchange.
 // It receives from the application specific source of messages.
 
-func publishToQueue(sessions chan chan session, msgs <-chan message, ctx context.Context) error {
+func publishToQueue(sessions chan chan session, msgs <-chan message, tracer opentracing.Tracer) error {
 
 	// This function dials, connects, declares, publishes, and tears down,
 	// all in one go. In a real service, you probably want to maintain a
 	// long-lived connection as state, and publish against that.
 
-
-
 	for session := range sessions {
-		sub := <-session
-		select {
-		case msg := <-msgs:
-			sp := opentracing.SpanFromContext(ctx)
-			defer sp.Finish()
+		pubSesh := <-session
+		for msg := range msgs {
 
-			// Inject the span context into the AMQP header.
-
+			spo := opentracing.ChildOf(msg.spanCtx)
+			sp := tracer.StartSpan("publishMessage", spo)
 
 			amqpMsg := amqp.Publishing{
 				Headers:         amqp.Table{},
-				ContentType:     "text/plain",
+				ContentType:     "application/json",
 				ContentEncoding: "",
 				Body:            msg.body,
 				DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
 				Priority:        0,              // 0-9
 				// a bunch of application/implementation-specific fields
 			}
+			// Inject the span context into the AMQP header.
 			if err := amqptracer.Inject(sp, amqpMsg.Headers); err != nil {
-				log.Fatal("amqp tracer couldn't inject message to headers",err)
+				log.Fatal("amqp tracer couldn't inject message to headers", err)
 
 			}
 			log.Printf("publishing %dB body (%q), routing: %s", len(msg.body), msg.body, msg.routingKey)
-			err := sub.Channel.Publish(
-				sub.exchangeName, // publish to an exchange
-				msg.routingKey,   // routing to 0 or more queues
-				false,            // mandatory
-				false,            // immediate
+
+			pubErr := pubSesh.Channel.Publish(
+				pubSesh.exchangeName, // publish to an exchange
+				msg.routingKey,       // routing to 0 or more queues
+				false,                // mandatory
+				false,                // immediate
 				amqpMsg,
 			)
 
-			if err != nil {
-				return fmt.Errorf("Exchange Publish: %s", err)
+			if pubErr != nil {
+				return fmt.Errorf("exchange publish error: %s", pubErr)
 			}
+			sp.Finish()
 		}
 	}
 
@@ -211,6 +205,7 @@ type ConsumeRequest struct {
 type message struct {
 	body       []byte
 	routingKey string
+	spanCtx    opentracing.SpanContext
 }
 
 // session composes an amqp.Connection with an amqp.Channel
@@ -236,7 +231,6 @@ func redial(ctx context.Context, url string, exchangeName string, exchangeType s
 	go func() {
 		sess := make(chan session)
 		defer close(sessions)
-
 		for {
 			select {
 			case sessions <- sess:
@@ -271,8 +265,11 @@ func redial(ctx context.Context, url string, exchangeName string, exchangeType s
 	return sessions
 }
 
-func isMsgFresh(cm ConsumeRequest) bool {
-	return time.Since(cm.timestamp).Seconds() > -180
+var REQUSET_TIMEOUT = 10.0
+
+func msgIsFresh(cm ConsumeRequest) bool {
+	return (time.Now().Unix() - cm.timestamp.Unix()) <= int64(REQUSET_TIMEOUT)
+
 }
 
 // publish publishes messages to a reconnecting session to a fanout exchange.
@@ -281,11 +278,8 @@ func isMsgFresh(cm ConsumeRequest) bool {
 // identity returns the same host/process unique string for the lifetime of
 // this process so that subscriber reconnections reuse the same queue name.
 
-func subscribe(queueName string, sessions chan chan session, consumeRequests chan ConsumeRequest, messages chan<- message, ctx context.Context) {
+func subscribe(queueName string, sessions chan chan session, consumeRequests chan ConsumeRequest, tracer opentracing.Tracer) {
 
-
-
-	log.Printf("subscribed to %s", queueName)
 	for session := range sessions {
 		sub := <-session
 
@@ -296,7 +290,7 @@ func subscribe(queueName string, sessions chan chan session, consumeRequests cha
 		}
 		//for consumeRequest := range consumeRequests {
 		bindKey := "#"
-		log.Println("binding to:", bindKey)
+		log.Println("subscriber binding to:", bindKey)
 		if err := sub.QueueBind(queueName, bindKey, sub.exchangeName, false, nil); err != nil {
 			log.Printf("cannot consume without a binding to exchange: %q, %v", sub.exchangeName, err)
 			return
@@ -310,52 +304,53 @@ func subscribe(queueName string, sessions chan chan session, consumeRequests cha
 
 		log.Printf("subscribed...")
 
-		curr := 0
-		seen := 0
+		defaultHeaders := make(map[string]interface{})
+		defaultHeaders["uber-trace-id"] = "stam"
 		for msg := range deliveries {
-			for consumeRequest := range consumeRequests {
-
-				log.Printf("got msg in deliveries! %v", msg.Body)
-				log.Println(strconv.Atoi(msg.RoutingKey))
-				routingKey, _ := strconv.Atoi(msg.RoutingKey)
-				if curr == 0 {
-					curr = consumeRequest.reqId
-				} else if curr == consumeRequest.reqId {
-					seen = seen + 1
-				}
-
-				if consumeRequest.reqId == routingKey {
-					spCtx, _ := amqptracer.Extract(msg.Headers)
-					sp := opentracing.StartSpan(
-						"ConsumeMessage",
-						opentracing.FollowsFrom(spCtx),
-					)
-					defer sp.Finish()
-
-					// Update the context with the span for the subsequent reference.
-					ctx = opentracing.ContextWithSpan(ctx, sp)
-
-					consumeRequest.reqChannel <- message{msg.Body, msg.RoutingKey}
-					sub.Ack(msg.DeliveryTag, false)
-					break
-				}
-				// Return message to queue if it's not stale yet
-				if isMsgFresh(consumeRequest) {
-					consumeRequests <- consumeRequest
-				} else {
-					sub.Ack(msg.DeliveryTag, false)
-				}
-
-				// break loop after going through all consume requests once
-				if seen > 0 {
-					curr = 0
-					seen = 0
-					break
-				}
-
+			routingKey, cerr := strconv.Atoi(msg.RoutingKey)
+			if cerr != nil {
+				log.Println("routing key was nil", cerr)
+				break
 			}
-		}
+			log.Printf("got msg in deliveries! %v", msg.Body)
+			log.Printf("routing key: %d", routingKey)
+			go func() {
+				for consumeRequest := range consumeRequests {
+					if consumeRequest.reqId == routingKey {
+						headers := msg.Headers
+						if msg.Headers["uber-trace-id"] == nil {
+							headers = defaultHeaders
+						}
+						carrier := opentracing.TextMapCarrier{"uber-trace-id": headers["uber-trace-id"].(string)}
+						spCtx, terr := tracer.Extract(opentracing.TextMap, carrier)
+						if terr != nil {
+							log.Printf("something went wrong %v", terr)
+						}
 
+						if spCtx == nil {
+							spCtx = tracer.StartSpan("span").Context()
+						}
+
+						sp := tracer.StartSpan(
+							"ReturnToClient",
+							opentracing.ChildOf(spCtx),
+						)
+						msg.Ack(false)
+						consumeRequest.reqChannel <- message{msg.Body, msg.RoutingKey, sp.Context()}
+						sp.Finish()
+						break
+					} else if msgIsFresh(consumeRequest) {
+						consumeRequests <- consumeRequest
+					} else {
+						log.Println("messages is stale")
+						log.Println(consumeRequest.timestamp)
+						log.Println("time.Since(cm.timestamp).Seconds()")
+						log.Println(time.Since(consumeRequest.timestamp).Seconds())
+						msg.Ack(false)
+					}
+				}
+			}()
+		}
 	}
 }
 
@@ -392,8 +387,11 @@ type CleanQuery struct {
 	values  url.Values
 }
 
-func requestHandler(consumeRequests chan ConsumeRequest, msgQueue chan<- message) http.Handler {
+func requestHandler(consumeRequests chan ConsumeRequest, msgQueue chan<- message, tracer opentracing.Tracer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		span := tracer.StartSpan("call-http")
+		defer span.Finish()
+		rand.Seed(time.Now().Unix())
 		requestId := rand.Intn(math.MaxInt8)
 		cq, err := buildQuery(r.URL)
 		fmt.Printf("%v", cq)
@@ -411,7 +409,7 @@ func requestHandler(consumeRequests chan ConsumeRequest, msgQueue chan<- message
 			return
 		}
 
-		routing := strings.Replace(cq.routing, "-", "", 1)
+		routing := strings.Replace(cq.routing, "-", "", -1)
 		request := DataRequest{cleanPath, requestId, cq.values}
 		subscribe := make(chan message)
 		defer close(subscribe)
@@ -421,7 +419,7 @@ func requestHandler(consumeRequests chan ConsumeRequest, msgQueue chan<- message
 			log.Printf("error %s", err)
 			return
 		}
-		msgQueue <- message{jsonRequest, routing}
+		msgQueue <- message{jsonRequest, routing, span.Context()}
 		log.Println("###  before consume requests!")
 		consumeRequests <- ConsumeRequest{reqId: requestId, reqChannel: subscribe, timestamp: time.Now()}
 		log.Println("before select!")
@@ -431,9 +429,11 @@ func requestHandler(consumeRequests chan ConsumeRequest, msgQueue chan<- message
 			w.Header().Set("Content-Type", "application/json")
 			// we are sending the second part of res since the first part is the id
 			fmt.Fprintf(w, "%s", res.body)
-		case <-time.After(180 * time.Second):
-			fmt.Println("timeout after 180 seconds")
-			w.WriteHeader(500)
+			//close(subscribe)
+		case <-time.After(time.Duration(REQUSET_TIMEOUT) * time.Second):
+			fmt.Printf("timeout after %f seconds \n", REQUSET_TIMEOUT)
+			w.WriteHeader(408)
+			//close(subscribe)
 		}
 
 	})
@@ -476,22 +476,16 @@ func main() {
 	msgSessions := redial(ctx, url, *_exchangeName, *_exchangeType, true, false)
 	pubsubSessions := redial(ctx, url, "pubsub", "topic", false, true)
 	toQueue := make(chan message)
-	fromPubSub := make(chan message)
-	consumeRequests := make(chan ConsumeRequest, 100)
+	consumeRequests := make(chan ConsumeRequest)
 
-	go func() {
-		publishToQueue(msgSessions, toQueue, ctx)
-		//done()
-	}()
+	go publishToQueue(msgSessions, toQueue, tracer)
 
-	go func() {
-		subscribe("response_pubsub", pubsubSessions, consumeRequests, fromPubSub, ctx)
-		//done()
-	}()
+	go subscribe("response_pubsub", pubsubSessions, consumeRequests, tracer)
+
 	defer done()
 
-	routerHttpHandler := Logger(requestHandler(consumeRequests, toQueue), "ds-proxy", tracer)
+	routerHttpHandler := Logger(requestHandler(consumeRequests, toQueue, tracer), "ds-proxy")
 	log.Fatal(http.ListenAndServe(":8080", routerHttpHandler))
 
-	<-ctx.Done()
+	//<-ctx.Done()
 }
