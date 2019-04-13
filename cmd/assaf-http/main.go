@@ -8,10 +8,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing-contrib/go-amqp/amqptracer"
+	"github.com/opentracing/opentracing-go"
 	"github.com/streadway/amqp"
-	jaeger "github.com/uber/jaeger-client-go"
-	config "github.com/uber/jaeger-client-go/config"
+	"github.com/uber/jaeger-client-go"
+	"github.com/uber/jaeger-client-go/config"
 	"io"
 	"log"
 	"math"
@@ -134,28 +135,38 @@ func publishToQueue(sessions chan chan session, msgs <-chan message, ctx context
 	// all in one go. In a real service, you probably want to maintain a
 	// long-lived connection as state, and publish against that.
 
-	span, _ := opentracing.StartSpanFromContext(ctx, "publish-to-queue")
-	defer span.Finish()
+
 
 	for session := range sessions {
 		sub := <-session
 		select {
 		case msg := <-msgs:
+			sp := opentracing.SpanFromContext(ctx)
+			defer sp.Finish()
+
+			// Inject the span context into the AMQP header.
+
+
+			amqpMsg := amqp.Publishing{
+				Headers:         amqp.Table{},
+				ContentType:     "text/plain",
+				ContentEncoding: "",
+				Body:            msg.body,
+				DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
+				Priority:        0,              // 0-9
+				// a bunch of application/implementation-specific fields
+			}
+			if err := amqptracer.Inject(sp, amqpMsg.Headers); err != nil {
+				log.Fatal("amqp tracer couldn't inject message to headers",err)
+
+			}
 			log.Printf("publishing %dB body (%q), routing: %s", len(msg.body), msg.body, msg.routingKey)
 			err := sub.Channel.Publish(
 				sub.exchangeName, // publish to an exchange
 				msg.routingKey,   // routing to 0 or more queues
 				false,            // mandatory
 				false,            // immediate
-				amqp.Publishing{
-					Headers:         amqp.Table{},
-					ContentType:     "text/plain",
-					ContentEncoding: "",
-					Body:            msg.body,
-					DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
-					Priority:        0,              // 0-9
-					// a bunch of application/implementation-specific fields
-				},
+				amqpMsg,
 			)
 
 			if err != nil {
@@ -272,8 +283,7 @@ func isMsgFresh(cm ConsumeRequest) bool {
 
 func subscribe(queueName string, sessions chan chan session, consumeRequests chan ConsumeRequest, messages chan<- message, ctx context.Context) {
 
-	span, _ := opentracing.StartSpanFromContext(ctx, "subscribe")
-	defer span.Finish()
+
 
 	log.Printf("subscribed to %s", queueName)
 	for session := range sessions {
@@ -315,6 +325,16 @@ func subscribe(queueName string, sessions chan chan session, consumeRequests cha
 				}
 
 				if consumeRequest.reqId == routingKey {
+					spCtx, _ := amqptracer.Extract(msg.Headers)
+					sp := opentracing.StartSpan(
+						"ConsumeMessage",
+						opentracing.FollowsFrom(spCtx),
+					)
+					defer sp.Finish()
+
+					// Update the context with the span for the subsequent reference.
+					ctx = opentracing.ContextWithSpan(ctx, sp)
+
 					consumeRequest.reqChannel <- message{msg.Body, msg.RoutingKey}
 					sub.Ack(msg.DeliveryTag, false)
 					break
