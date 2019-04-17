@@ -1,4 +1,4 @@
-// This example declares a durable Exchange, and publishes a single message to
+// This example declares a durable Exchange, and publishes a single Message to
 // that Exchange with a given routing key.
 //
 package main
@@ -6,8 +6,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"github.com/assaf/assaf-http-server/models"
 	"github.com/opentracing-contrib/go-amqp/amqptracer"
 	"github.com/opentracing/opentracing-go"
 	"github.com/streadway/amqp"
@@ -22,6 +24,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,29 +33,36 @@ var (
 	_exchangeName = flag.String("exchange", "ds-exchange", "Durable AMQP exchange name")
 	_exchangeType = flag.String("exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
 	//_routingKey   = flag.String("key", "acrit", "AMQP routing key")
-	//_body         = flag.String("body", `{"profile":"PHP Developer"}`, "Body of message")
+	//_body         = flag.String("Body", `{"profile":"PHP Developer"}`, "Body of Message")
 	//_reliable     = flag.Bool("reliable", true, "Wait for the publisher confirmation before exiting")
 )
 
 // initJaeger returns an instance of Jaeger Tracer that samples 100% of traces and logs all spans to stdout.
 func initJaeger(service string) (opentracing.Tracer, io.Closer) {
-	cfg := &config.Configuration{
-		Sampler: &config.SamplerConfig{
-			Type:  "const",
-			Param: 1,
-		},
-		Reporter: &config.ReporterConfig{
-			LogSpans: true,
-		},
-		ServiceName: service,
+	//cfg := &config.Configuration{
+	//	Sampler: &config.SamplerConfig{
+	//		Type:  "const",
+	//		Param: 1,
+	//	},
+	//	Reporter: &config.ReporterConfig{
+	//		LogSpans: true,
+	//	},
+	//	ServiceName: service,
+	//}
+	cfg, err := config.FromEnv()
+	if err != nil {
+		panic(fmt.Sprintf("ERROR: cannot init Jaeger: %v\n", err))
 	}
-
+	cfg.Sampler.Type = "const"
+	cfg.Sampler.Param = 1
+	cfg.ServiceName = service
+	cfg.Reporter.LogSpans = true
 	log.Print("#######################")
-	log.Print(cfg.Sampler.SamplingServerURL)
+	log.Print(cfg.Reporter.LocalAgentHostPort)
 
 	tracer, closer, err := cfg.NewTracer(config.Logger(jaeger.StdLogger))
 	if err != nil {
-		panic(fmt.Sprintf("ERROR: cannot init Jaeger: %v\n", err))
+		log.Panic("can not init jaeger %v", err)
 	}
 	return tracer, closer
 }
@@ -75,8 +85,8 @@ func Logger(inner http.Handler, name string) http.Handler {
 	})
 }
 
-func RabbitConnect(amqpURI string) (session, error) {
-	nilSession := session{nil, nil, "error", "error"}
+func RabbitConnect(amqpURI string) (models.Session, error) {
+	nilSession := models.Session{nil, nil, "error", "error"}
 	log.Printf("dialing %q", amqpURI)
 	connection, err := amqp.Dial(amqpURI)
 	if err != nil {
@@ -101,7 +111,7 @@ func RabbitConnect(amqpURI string) (session, error) {
 	//
 	//defer confirmOne(confirms)
 
-	return session{connection, channel, "", ""}, nil
+	return models.Session{connection, channel, "", ""}, nil
 }
 
 func declareExchange(channel *amqp.Channel, exchangeName string, exchangeType string, isDurable bool, isAutoDelete bool) error {
@@ -122,10 +132,10 @@ func declareExchange(channel *amqp.Channel, exchangeName string, exchangeType st
 	return nil
 }
 
-// publish publishes messages to a reconnecting session to a fanout exchange.
+// publish publishes messages to a reconnecting Session to a fanout exchange.
 // It receives from the application specific source of messages.
 
-func publishToQueue(sessions chan chan session, msgs <-chan message, tracer opentracing.Tracer) error {
+func publishToQueue(sessions chan chan models.Session, msgs <-chan models.Message, tracer opentracing.Tracer) error {
 
 	// This function dials, connects, declares, publishes, and tears down,
 	// all in one go. In a real service, you probably want to maintain a
@@ -135,28 +145,28 @@ func publishToQueue(sessions chan chan session, msgs <-chan message, tracer open
 		pubSesh := <-session
 		for msg := range msgs {
 
-			spo := opentracing.ChildOf(msg.spanCtx)
+			spo := opentracing.ChildOf(msg.SpanCtx)
 			sp := tracer.StartSpan("publishMessage", spo)
 
 			amqpMsg := amqp.Publishing{
 				Headers:         amqp.Table{},
 				ContentType:     "application/json",
 				ContentEncoding: "",
-				Body:            msg.body,
+				Body:            msg.Body,
 				DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
 				Priority:        0,              // 0-9
 				// a bunch of application/implementation-specific fields
 			}
 			// Inject the span context into the AMQP header.
 			if err := amqptracer.Inject(sp, amqpMsg.Headers); err != nil {
-				log.Fatal("amqp tracer couldn't inject message to headers", err)
+				log.Fatal("amqp tracer couldn't inject Message to headers", err)
 
 			}
-			log.Printf("publishing %dB body (%q), routing: %s", len(msg.body), msg.body, msg.routingKey)
+			log.Printf("publishing %dB Body (%q), routing: %s", len(msg.Body), msg.Body, msg.RoutingKey)
 
 			pubErr := pubSesh.Channel.Publish(
-				pubSesh.exchangeName, // publish to an exchange
-				msg.routingKey,       // routing to 0 or more queues
+				pubSesh.ExchangeName, // publish to an exchange
+				msg.RoutingKey,       // routing to 0 or more queues
 				false,                // mandatory
 				false,                // immediate
 				amqpMsg,
@@ -172,70 +182,18 @@ func publishToQueue(sessions chan chan session, msgs <-chan message, tracer open
 	return nil
 }
 
-// One would typically keep a channel of publishings, a sequence number, and a
-// set of unacknowledged sequence numbers and loop until the publishing channel
-// is closed.
-func confirmOne(confirms <-chan amqp.Confirmation) {
-	log.Printf("waiting for confirmation of one publishing")
-
-	if confirmed := <-confirms; confirmed.Ack {
-		log.Printf("confirmed delivery with delivery tag: %d", confirmed.DeliveryTag)
-	} else {
-		log.Printf("failed delivery of delivery tag: %d", confirmed.DeliveryTag)
-	}
-}
-
-// A message going over the wire
-type DataRequest struct {
-	Body      string     `json:"body"`
-	RequestID int        `json:"request-id"`
-	Options   url.Values `json:"options"`
-}
-
-// A request message connecting between the http endpoint and the
-// async nature of rabbitmq
-type ConsumeRequest struct {
-	reqId      int
-	reqChannel chan<- message
-	timestamp  time.Time
-}
-
-// message is the application type for a message.  This can contain identity,
-// or a reference to the recevier chan for further demuxing.
-type message struct {
-	body       []byte
-	routingKey string
-	spanCtx    opentracing.SpanContext
-}
-
-// session composes an amqp.Connection with an amqp.Channel
-type session struct {
-	*amqp.Connection
-	*amqp.Channel
-	exchangeName string
-	exchangeType string
-}
-
-// Close tears the connection down, taking the channel with it.
-func (s session) Close() error {
-	if s.Connection == nil {
-		return nil
-	}
-	return s.Connection.Close()
-}
-
 // redial continually connects to the URL, exiting the program when no longer possible
-func redial(ctx context.Context, url string, exchangeName string, exchangeType string, isDurable bool, isAutoDelete bool) chan chan session {
-	sessions := make(chan chan session)
+func redial(ctx context.Context, url string, exchangeName string, exchangeType string, isDurable bool, isAutoDelete bool) chan chan models.Session {
+	sessions := make(chan chan models.Session)
 
 	go func() {
-		sess := make(chan session)
+		sess := make(chan models.Session)
 		defer close(sessions)
 		for {
 			select {
 			case sessions <- sess:
 			case <-ctx.Done():
-				log.Println("shutting down session factory")
+				log.Println("shutting down Session factory")
 				return
 			}
 
@@ -247,8 +205,9 @@ func redial(ctx context.Context, url string, exchangeName string, exchangeType s
 			if err != nil {
 				log.Fatalf("couldn't create exchange %v", err)
 			}
-			log.Printf("session created in redial %v", partialSession)
-			currSession := session{partialSession.Connection, partialSession.Channel, exchangeName, exchangeType}
+			log.Printf("Session created in redial %v", partialSession)
+
+			currSession := models.Session{partialSession.Connection, partialSession.Channel, exchangeName, exchangeType}
 			if err != nil {
 				log.Fatalf("Channel could not be put into confirm mode: %s", err)
 			}
@@ -256,7 +215,7 @@ func redial(ctx context.Context, url string, exchangeName string, exchangeType s
 			select {
 			case sess <- currSession:
 			case <-ctx.Done():
-				log.Println("shutting down new session")
+				log.Println("shutting down new Session")
 				currSession.Close()
 			}
 		}
@@ -265,25 +224,25 @@ func redial(ctx context.Context, url string, exchangeName string, exchangeType s
 	return sessions
 }
 
-var REQUSET_TIMEOUT = 10.0
+var REQUSET_TIMEOUT = 60.0
 
-func msgIsFresh(cm ConsumeRequest) bool {
-	return (time.Now().Unix() - cm.timestamp.Unix()) <= int64(REQUSET_TIMEOUT)
+func msgIsFresh(cm models.ConsumeRequest) bool {
+	return (time.Now().Unix() - cm.Timestamp.Unix()) <= int64(REQUSET_TIMEOUT)
 
 }
 
-// publish publishes messages to a reconnecting session to a fanout exchange.
+// publish publishes messages to a reconnecting Session to a fanout exchange.
 // It receives from the application specific source of messages.
 
 // identity returns the same host/process unique string for the lifetime of
 // this process so that subscriber reconnections reuse the same queue name.
 
-func subscribe(queueName string, sessions chan chan session, consumeRequests chan ConsumeRequest, tracer opentracing.Tracer) {
+func subscribe(queueName string, sessions chan chan models.Session, tracer opentracing.Tracer, requests *Reqs) {
 
 	for session := range sessions {
 		sub := <-session
 
-		log.Printf("got session with exchange %s in subscribe", sub.exchangeName)
+		log.Printf("got Session with exchange %s in subscribe", sub.ExchangeName)
 		if _, err := sub.QueueDeclare(queueName, false, true, false, false, nil); err != nil {
 			log.Printf("cannot consume from queue: %q, %v", queueName, err)
 			return
@@ -291,8 +250,8 @@ func subscribe(queueName string, sessions chan chan session, consumeRequests cha
 		//for consumeRequest := range consumeRequests {
 		bindKey := "#"
 		log.Println("subscriber binding to:", bindKey)
-		if err := sub.QueueBind(queueName, bindKey, sub.exchangeName, false, nil); err != nil {
-			log.Printf("cannot consume without a binding to exchange: %q, %v", sub.exchangeName, err)
+		if err := sub.QueueBind(queueName, bindKey, sub.ExchangeName, false, nil); err != nil {
+			log.Printf("cannot consume without a binding to exchange: %q, %v", sub.ExchangeName, err)
 			return
 		}
 
@@ -306,52 +265,52 @@ func subscribe(queueName string, sessions chan chan session, consumeRequests cha
 
 		defaultHeaders := make(map[string]interface{})
 		defaultHeaders["uber-trace-id"] = "stam"
-		for msg := range deliveries {
-			routingKey, cerr := strconv.Atoi(msg.RoutingKey)
-			if cerr != nil {
-				log.Println("routing key was nil", cerr)
-				break
-			}
-			log.Printf("got msg in deliveries! %v", msg.Body)
-			log.Printf("routing key: %d", routingKey)
-			go func() {
-				for consumeRequest := range consumeRequests {
-					if consumeRequest.reqId == routingKey {
-						headers := msg.Headers
-						if msg.Headers["uber-trace-id"] == nil {
-							headers = defaultHeaders
-						}
-						carrier := opentracing.TextMapCarrier{"uber-trace-id": headers["uber-trace-id"].(string)}
-						spCtx, terr := tracer.Extract(opentracing.TextMap, carrier)
-						if terr != nil {
-							log.Printf("something went wrong %v", terr)
-						}
-
-						if spCtx == nil {
-							spCtx = tracer.StartSpan("span").Context()
-						}
-
-						sp := tracer.StartSpan(
-							"ReturnToClient",
-							opentracing.ChildOf(spCtx),
-						)
-						msg.Ack(false)
-						consumeRequest.reqChannel <- message{msg.Body, msg.RoutingKey, sp.Context()}
-						sp.Finish()
-						break
-					} else if msgIsFresh(consumeRequest) {
-						consumeRequests <- consumeRequest
-					} else {
-						log.Println("messages is stale")
-						log.Println(consumeRequest.timestamp)
-						log.Println("time.Since(cm.timestamp).Seconds()")
-						log.Println(time.Since(consumeRequest.timestamp).Seconds())
-						msg.Ack(false)
-					}
-				}
-			}()
+		for n_msg := range deliveries {
+			go returnResponse(n_msg, requests, defaultHeaders, tracer)
 		}
 	}
+}
+
+func returnResponse(c_msg amqp.Delivery, requests *Reqs, defaultHeaders map[string]interface{}, tracer opentracing.Tracer) error {
+	routingKey, cerr := strconv.Atoi(c_msg.RoutingKey)
+	if cerr != nil {
+		log.Println("routing key was nil", cerr)
+	}
+
+	consumeRequest, ok := requests.Load(routingKey)
+
+	if ok == false {
+		return errors.New("request not found")
+	}
+	headers := c_msg.Headers
+	if c_msg.Headers["uber-trace-id"] == nil {
+		headers = defaultHeaders
+	}
+	carrier := opentracing.TextMapCarrier{"uber-trace-id": headers["uber-trace-id"].(string)}
+	spCtx, terr := tracer.Extract(opentracing.TextMap, carrier)
+	if terr != nil {
+		return errors.New("no trace to extract")
+	}
+
+	if spCtx == nil {
+		spCtx = tracer.StartSpan("span").Context()
+	}
+
+	sp := tracer.StartSpan(
+		"ReturnToClient",
+		opentracing.ChildOf(spCtx),
+	)
+	c_msg.Ack(false)
+	log.Printf("got request id: %d", consumeRequest.ReqId)
+	select {
+	case <-consumeRequest.ReqChannel:
+		print("!!!!! channel already closed")
+		return errors.New("request closed before response")
+	case consumeRequest.ReqChannel <- models.Message{Body: c_msg.Body, RoutingKey: c_msg.RoutingKey, SpanCtx: sp.Context()}:
+	}
+
+	sp.Finish()
+	return nil
 }
 
 func buildQuery(u *url.URL) (CleanQuery, error) {
@@ -387,12 +346,12 @@ type CleanQuery struct {
 	values  url.Values
 }
 
-func requestHandler(consumeRequests chan ConsumeRequest, msgQueue chan<- message, tracer opentracing.Tracer) http.Handler {
+func requestHandler(msgQueue chan<- models.Message, tracer opentracing.Tracer, requests *Reqs) http.Handler {
+	rand.Seed(time.Now().Unix())
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		span := tracer.StartSpan("call-http")
 		defer span.Finish()
-		rand.Seed(time.Now().Unix())
-		requestId := rand.Intn(math.MaxInt8)
+		requestId := rand.Intn(math.MaxInt32)
 		cq, err := buildQuery(r.URL)
 		fmt.Printf("%v", cq)
 		if err != nil {
@@ -410,25 +369,30 @@ func requestHandler(consumeRequests chan ConsumeRequest, msgQueue chan<- message
 		}
 
 		routing := strings.Replace(cq.routing, "-", "", -1)
-		request := DataRequest{cleanPath, requestId, cq.values}
-		subscribe := make(chan message)
-		defer close(subscribe)
+		request := models.DataRequest{cleanPath, requestId, cq.values}
 		jsonRequest, err := json.Marshal(request)
 		if err != nil {
 			fmt.Fprintf(w, "error: %s", err)
 			log.Printf("error %s", err)
 			return
 		}
-		msgQueue <- message{jsonRequest, routing, span.Context()}
-		log.Println("###  before consume requests!")
-		consumeRequests <- ConsumeRequest{reqId: requestId, reqChannel: subscribe, timestamp: time.Now()}
+		subscribe := make(chan models.Message)
+		// if this request returns the done channel should
+		// complete before the subscribe channel defending us from
+		// send on closed channel panics
+		defer close(subscribe)
+
+		msgQueue <- models.Message{jsonRequest, routing, span.Context()}
+
+		requests.Store(requestId, models.ConsumeRequest{ReqId: requestId, ReqChannel: subscribe, Timestamp: time.Now()})
+		defer requests.Delete(requestId)
 		log.Println("before select!")
 		select {
 		case res := <-subscribe:
-			log.Printf("in controller length: %d, 1st: %s, 2nd %s", len(res.body), res.body, res.routingKey)
+			log.Printf("in controller length: %d, routing key: %s, request uri: %v", len(res.Body), res.RoutingKey, r.RequestURI)
 			w.Header().Set("Content-Type", "application/json")
 			// we are sending the second part of res since the first part is the id
-			fmt.Fprintf(w, "%s", res.body)
+			fmt.Fprintf(w, "%s", res.Body)
 			//close(subscribe)
 		case <-time.After(time.Duration(REQUSET_TIMEOUT) * time.Second):
 			fmt.Printf("timeout after %f seconds \n", REQUSET_TIMEOUT)
@@ -464,27 +428,57 @@ func (rc RabbitMQConf) String() string {
 	return fmt.Sprintf("amqp://%s:%s@%s:%d/", rc.user, rc.pass, rc.host, rc.port)
 }
 
+type Reqs struct {
+	sync.RWMutex
+	internal map[int]models.ConsumeRequest
+}
+
+func NewReqs() *Reqs {
+	return &Reqs{
+		internal: make(map[int]models.ConsumeRequest),
+	}
+}
+
+func (rm *Reqs) Load(key int) (value models.ConsumeRequest, ok bool) {
+	rm.RLock()
+	result, ok := rm.internal[key]
+	rm.RUnlock()
+	return result, ok
+}
+
+func (rm *Reqs) Delete(key int) {
+	rm.Lock()
+	delete(rm.internal, key)
+	rm.Unlock()
+}
+
+func (rm *Reqs) Store(key int, value models.ConsumeRequest) {
+	rm.Lock()
+	rm.internal[key] = value
+	rm.Unlock()
+}
 func main() {
 
 	tracer, closer := initJaeger("assaf-frontend")
 	defer closer.Close()
 
-	url := fmt.Sprint(getRabbitConf())
+	rabbit_url := fmt.Sprint(getRabbitConf())
 
 	ctx, done := context.WithCancel(context.Background())
 
-	msgSessions := redial(ctx, url, *_exchangeName, *_exchangeType, true, false)
-	pubsubSessions := redial(ctx, url, "pubsub", "topic", false, true)
-	toQueue := make(chan message)
-	consumeRequests := make(chan ConsumeRequest)
+	msgSessions := redial(ctx, rabbit_url, *_exchangeName, *_exchangeType, true, false)
+	pubsubSessions := redial(ctx, rabbit_url, "pubsub", "topic", false, true)
+	toQueue := make(chan models.Message)
+
+	requests := NewReqs()
 
 	go publishToQueue(msgSessions, toQueue, tracer)
 
-	go subscribe("response_pubsub", pubsubSessions, consumeRequests, tracer)
+	go subscribe("response_pubsub", pubsubSessions, tracer, requests)
 
 	defer done()
 
-	routerHttpHandler := Logger(requestHandler(consumeRequests, toQueue, tracer), "ds-proxy")
+	routerHttpHandler := Logger(requestHandler(toQueue, tracer, requests), "ds-proxy")
 	log.Fatal(http.ListenAndServe(":8080", routerHttpHandler))
 
 	//<-ctx.Done()
