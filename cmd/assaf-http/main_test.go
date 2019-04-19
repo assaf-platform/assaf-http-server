@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/assaf/assaf-http-server/models"
 	"github.com/stretchr/testify/assert"
 	"io/ioutil"
 	"log"
@@ -37,10 +38,11 @@ func testRabbitConf(t assert.TestingT) {
 
 func testTimeDecay(t assert.TestingT) {
 	when := time.Now()
-	fresh := isMsgFresh(ConsumeRequest{1, make(chan message), when.Add(181 * time.Second)})
-	assert.Equal(t, false, fresh)
-	fresh = isMsgFresh(ConsumeRequest{1, make(chan message), when})
+	//t.Errorf("Hello!")
+	fresh := msgIsFresh(models.ConsumeRequest{1, make(chan models.Message), when.Add(-10 * time.Second)})
 	assert.Equal(t, true, fresh)
+	fresh = msgIsFresh(models.ConsumeRequest{1, make(chan models.Message), when})
+	assert.Equal(t, false, fresh)
 
 }
 func testParseURI(t assert.TestingT) {
