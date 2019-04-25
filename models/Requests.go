@@ -36,6 +36,7 @@ type Message struct {
 	Body       []byte
 	RoutingKey string
 	SpanCtx    opentracing.SpanContext
+	HttpStatus int32
 }
 
 // Session composes an amqp.Connection with an amqp.Channel

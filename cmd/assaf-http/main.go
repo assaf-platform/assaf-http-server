@@ -252,25 +252,49 @@ func subscribe(queueName string, sessions chan chan models.Session, tracer opent
 
 		log.Printf("subscribed...")
 
-		defaultHeaders := make(map[string]interface{})
-		defaultHeaders["uber-trace-id"] = "stam"
 		for n_msg := range deliveries {
-			go returnResponse(n_msg, requests, defaultHeaders, tracer)
+			go returnResponse(n_msg, requests, tracer)
 		}
 	}
 }
-
-func returnResponse(c_msg amqp.Delivery, requests *Reqs, defaultHeaders map[string]interface{}, tracer opentracing.Tracer) error {
+func returnResponse(c_msg amqp.Delivery, requests *Reqs, tracer opentracing.Tracer) error {
 	routingKey, cerr := strconv.Atoi(c_msg.RoutingKey)
 	if cerr != nil {
 		log.Println("routing key was nil", cerr)
 	}
 
 	consumeRequest, ok := requests.Load(routingKey)
-
 	if ok == false {
 		return errors.New("request not found")
 	}
+
+	sp, e := getOrCreateSpan(c_msg, tracer)
+	defer sp.Finish()
+	if e != nil {
+		log.Printf("Span was not created %v", e)
+	}
+	c_msg.Ack(false)
+	log.Printf("got request id: %d", consumeRequest.ReqId)
+
+	_http_status := c_msg.Headers["http-status"]
+	http_status := int32(200)
+	if _http_status != nil {
+		http_status = _http_status.(int32)
+	}
+
+	select {
+	case <-consumeRequest.ReqChannel:
+		// This is done in order to no send on a closed channel which leads to panics
+		return errors.New("request closed before response")
+	case consumeRequest.ReqChannel <- models.Message{Body: c_msg.Body, RoutingKey: c_msg.RoutingKey, SpanCtx: sp.Context(), HttpStatus: http_status}:
+	}
+	return nil
+}
+
+func getOrCreateSpan(c_msg amqp.Delivery, tracer opentracing.Tracer) (opentracing.Span, error) {
+	defaultHeaders := make(map[string]interface{})
+	defaultHeaders["uber-trace-id"] = "stam"
+
 	headers := c_msg.Headers
 	if c_msg.Headers["uber-trace-id"] == nil {
 		headers = defaultHeaders
@@ -278,28 +302,16 @@ func returnResponse(c_msg amqp.Delivery, requests *Reqs, defaultHeaders map[stri
 	carrier := opentracing.TextMapCarrier{"uber-trace-id": headers["uber-trace-id"].(string)}
 	spCtx, terr := tracer.Extract(opentracing.TextMap, carrier)
 	if terr != nil {
-		return errors.New("no trace to extract")
+		return nil, errors.New("no trace to extract")
 	}
-
 	if spCtx == nil {
 		spCtx = tracer.StartSpan("span").Context()
 	}
-
 	sp := tracer.StartSpan(
 		"ReturnToClient",
 		opentracing.ChildOf(spCtx),
 	)
-	c_msg.Ack(false)
-	log.Printf("got request id: %d", consumeRequest.ReqId)
-	select {
-	case <-consumeRequest.ReqChannel:
-		print("!!!!! channel already closed")
-		return errors.New("request closed before response")
-	case consumeRequest.ReqChannel <- models.Message{Body: c_msg.Body, RoutingKey: c_msg.RoutingKey, SpanCtx: sp.Context()}:
-	}
-
-	sp.Finish()
-	return nil
+	return sp, nil
 }
 
 func buildQuery(u *url.URL) (CleanQuery, error) {
@@ -351,6 +363,7 @@ func requestHandler(msgQueue chan<- models.Message, tracer opentracing.Tracer, r
 
 		cleanPath, err := cleanRequest(cq.p)
 
+		span.SetTag("request path", cleanPath)
 		if err != nil {
 			fmt.Fprintf(w, "error: %s", err)
 			log.Printf("error %s", err)
@@ -371,22 +384,23 @@ func requestHandler(msgQueue chan<- models.Message, tracer opentracing.Tracer, r
 		// send on closed channel panics
 		defer close(subscribe)
 
-		msgQueue <- models.Message{jsonRequest, routing, span.Context()}
+		msgQueue <- models.Message{jsonRequest, routing, span.Context(), 0}
 
 		requests.Store(requestId, models.ConsumeRequest{ReqId: requestId, ReqChannel: subscribe, Timestamp: time.Now()})
 		defer requests.Delete(requestId)
-		log.Println("before select!")
 		select {
 		case res := <-subscribe:
 			log.Printf("in controller length: %d, routing key: %s, request uri: %v", len(res.Body), res.RoutingKey, r.RequestURI)
 			w.Header().Set("Content-Type", "application/json")
+			if res.HttpStatus != 0 {
+				w.WriteHeader(int(res.HttpStatus))
+			}
 			// we are sending the second part of res since the first part is the id
 			fmt.Fprintf(w, "%s", res.Body)
 			//close(subscribe)
 		case <-time.After(time.Duration(REQUSET_TIMEOUT) * time.Second):
 			fmt.Printf("timeout after %f seconds \n", REQUSET_TIMEOUT)
-			w.WriteHeader(408)
-			//close(subscribe)
+			w.WriteHeader(http.StatusRequestTimeout)
 		}
 
 	})
