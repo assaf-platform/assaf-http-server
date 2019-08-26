@@ -334,7 +334,7 @@ func buildQuery(u *url.URL, body []byte) (CleanQuery, error) {
 
 	log.Printf("got query %s", p)
 
-	path := strings.SplitN(p.Path, "/"+conf.AssafConf.Base, 2)
+	path := strings.SplitN(p.Path, "/"+conf.Assaf.Ns, 2)
 	cleanQuery := strings.Split(path[1], "/")
 
 	if len(body) > 0 {
@@ -508,7 +508,7 @@ func main() {
 	defer done()
 
 	routerHttpHandler := Logger(requestHandler(toQueue, tracer, requests), "ds-proxy")
-	http.Handle("/"+conf.AssafConf.Base+"/", routerHttpHandler)
+	http.Handle(conf.AssafBase, routerHttpHandler)
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
 
