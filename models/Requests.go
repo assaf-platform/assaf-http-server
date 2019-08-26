@@ -3,15 +3,14 @@ package models
 import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/streadway/amqp"
-	"net/url"
 	"time"
 )
 
 // A Message going over the wire
 type DataRequest struct {
-	Body      string     `json:"body"`
-	RequestID int        `json:"request-id"`
-	Options   url.Values `json:"options"`
+	Body      string                 `json:"body"`
+	RequestID int                    `json:"request-id"`
+	Options   map[string]interface{} `json:"options"`
 }
 
 // Close tears the connection down, taking the channel with it.

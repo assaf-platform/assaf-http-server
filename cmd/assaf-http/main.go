@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/assaf/assaf-http-server/conf"
 	"github.com/assaf/assaf-http-server/models"
 	"github.com/opentracing-contrib/go-amqp/amqptracer"
 	"github.com/opentracing/opentracing-go"
@@ -16,6 +17,7 @@ import (
 	"github.com/uber/jaeger-client-go"
 	"github.com/uber/jaeger-client-go/config"
 	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -269,10 +271,12 @@ func returnResponse(c_msg amqp.Delivery, requests *Reqs, tracer opentracing.Trac
 	}
 
 	sp, e := getOrCreateSpan(c_msg, tracer)
-	defer sp.Finish()
 	if e != nil {
 		log.Printf("Span was not created %v", e)
+	} else {
+		defer sp.Finish()
 	}
+
 	c_msg.Ack(false)
 	log.Printf("got request id: %d", consumeRequest.ReqId)
 
@@ -286,7 +290,7 @@ func returnResponse(c_msg amqp.Delivery, requests *Reqs, tracer opentracing.Trac
 	case <-consumeRequest.ReqChannel:
 		// This is done in order to no send on a closed channel which leads to panics
 		return errors.New("request closed before response")
-	case consumeRequest.ReqChannel <- models.Message{Body: c_msg.Body, RoutingKey: c_msg.RoutingKey, SpanCtx: sp.Context(), HttpStatus: http_status}:
+	case consumeRequest.ReqChannel <- models.Message{Body: c_msg.Body, RoutingKey: c_msg.RoutingKey, HttpStatus: http_status}:
 	}
 	return nil
 }
@@ -314,9 +318,15 @@ func getOrCreateSpan(c_msg amqp.Delivery, tracer opentracing.Tracer) (opentracin
 	return sp, nil
 }
 
-func buildQuery(u *url.URL) (CleanQuery, error) {
+func buildQuery(u *url.URL, body []byte) (CleanQuery, error) {
+
 	p, err := url.ParseRequestURI(u.RequestURI())
-	blank := CleanQuery{"", "", p.Query()}
+	values := make(map[string]interface{})
+	for key, _ := range p.Query() {
+		values[key] = p.Query().Get(key)
+	}
+	blank := CleanQuery{"", "", values}
+
 	fmt.Printf("%v", p)
 	if err != nil {
 		return blank, err
@@ -324,12 +334,26 @@ func buildQuery(u *url.URL) (CleanQuery, error) {
 
 	log.Printf("got query %s", p)
 
-	cleanQuery := strings.Split(p.Path, "/")
+	path := strings.SplitN(p.Path, "/"+conf.AssafConf.Base, 2)
+	cleanQuery := strings.Split(path[1], "/")
+
+	if len(body) > 0 {
+		// A bit of a dirty hack to keep error handling
+		cleanQuery = append(cleanQuery, "")
+
+		err := json.Unmarshal([]byte(body), &values)
+
+		if err != nil {
+			log.Println("couldn't unmarshal body")
+		}
+	}
+
 	if len(cleanQuery) < 3 {
 		return blank, url.EscapeError("bad request, not enough arguments")
 	}
-	return CleanQuery{routing: cleanQuery[1], p: cleanQuery[2], values: p.Query()}, nil
+	return CleanQuery{routing: cleanQuery[1], p: cleanQuery[2], values: values}, nil
 }
+
 func cleanRequest(p string) (string, error) {
 
 	cleanPath, err := url.QueryUnescape(p)
@@ -344,7 +368,7 @@ func cleanRequest(p string) (string, error) {
 type CleanQuery struct {
 	routing string
 	p       string
-	values  url.Values
+	values  map[string]interface{}
 }
 
 func requestHandler(msgQueue chan<- models.Message, tracer opentracing.Tracer, requests *Reqs) http.Handler {
@@ -353,7 +377,9 @@ func requestHandler(msgQueue chan<- models.Message, tracer opentracing.Tracer, r
 		span := tracer.StartSpan("call-http")
 		defer span.Finish()
 		requestId := rand.Intn(math.MaxInt32)
-		cq, err := buildQuery(r.URL)
+		bodyBytes, err := ioutil.ReadAll(r.Body)
+		cq, err := buildQuery(r.URL, bodyBytes)
+
 		fmt.Printf("%v", cq)
 		if err != nil {
 			fmt.Fprintf(w, "error: %s", err)
@@ -482,7 +508,9 @@ func main() {
 	defer done()
 
 	routerHttpHandler := Logger(requestHandler(toQueue, tracer, requests), "ds-proxy")
-	log.Fatal(http.ListenAndServe(":8080", routerHttpHandler))
+	http.Handle("/"+conf.AssafConf.Base+"/", routerHttpHandler)
+
+	log.Fatal(http.ListenAndServe(":8080", nil))
 
 	//<-ctx.Done()
 }
